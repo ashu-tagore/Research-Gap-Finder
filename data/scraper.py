@@ -10,6 +10,9 @@ except ImportError:
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 HEADERS = {"User-Agent": "ResearchGapFinder/1.0 (aswat0thama@gmail.com)"}
 
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
 SEARCH_QUERY = "cat:cs.AI OR cat:cs.LG OR cat:cs.CV OR cat:cs.CL OR cat:cs.NE OR cat:cs.RO"
 
 MAX_RESULTS = 500
@@ -73,26 +76,31 @@ def fetch_batch(start: int) -> list:
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = requests.get(ARXIV_API_URL, params=params, headers=HEADERS, timeout=60)
+            response = SESSION.get(ARXIV_API_URL, params=params, timeout=60)
         except requests.exceptions.Timeout:
             error_msg = "timed out"
+            wait = attempt * 20
         else:
             if response.status_code == 200:
                 feed = feedparser.parse(response.text)
                 return [parse_entry(e) for e in feed.entries]
             if response.status_code not in RETRYABLE_STATUS:
                 print(f"  Error fetching batch at start={start}: HTTP {response.status_code}")
-                return []
+                return None
             error_msg = f"HTTP {response.status_code}"
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After", "")
+                wait = int(retry_after) if retry_after.isdigit() else (2 ** attempt) * 60
+            else:
+                wait = attempt * 20
 
         if attempt < MAX_RETRIES:
-            wait = (2 ** attempt) * 60 if "429" in error_msg else attempt * 20
             print(f"  Batch start={start} got {error_msg}, retrying in {wait}s (attempt {attempt}/{MAX_RETRIES})...")
             time.sleep(wait)
         else:
             print(f"  Batch start={start} failed after {MAX_RETRIES} attempts ({error_msg}) — skipping.")
 
-    return []
+    return None
 
 
 def save_papers(papers: list) -> int:
@@ -134,7 +142,11 @@ def run_scraper():
 
         papers = fetch_batch(start)
 
-        if not papers:  # if arXiv returns an empty batch, there's nothing more to fetch. Stop early instead of making unnecessary requests.
+        if papers is None:
+            print("  Batch failed — skipping.")
+            continue
+
+        if not papers:
             print("  Empty batch — stopping early.")
             break
 
