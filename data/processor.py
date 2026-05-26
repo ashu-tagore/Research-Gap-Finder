@@ -146,6 +146,22 @@ RESOURCE_KEYWORDS = [
     "distributed training",
 ]
 
+# methods with known successors — low paper count + successor exists = likely obsolete,
+# not a genuine gap worth pursuing
+SUCCESSOR_MAP = {
+    "random forest"  : "gradient boosting or deep learning",
+    "autoencoder"    : "diffusion model or VAE",
+    "self-supervised": "contrastive learning or masked autoencoders",
+}
+
+# minimum papers across ALL domains for a method to be considered still active.
+# if a method barely appears anywhere in recent literature, it's fading out
+MIN_METHOD_ACTIVITY = 10
+
+# minimum papers across ALL methods for a domain to be considered active research area.
+# a domain with almost no papers is too niche to reliably detect gaps in
+MIN_DOMAIN_ACTIVITY = 15
+
 # if fewer than this many papers exist for a method-domain pair, we call it a gap.
 # tunable — raise for stricter gaps, lower for more gaps
 GAP_THRESHOLD = 5
@@ -159,12 +175,13 @@ def classify_paper(categories: str, abstract: str) -> list[str]:
     subfields      = set()
     # set not list — a paper matching cs.LG in CATEGORY_MAP AND "machine learning" in KEYWORD_MAP
     # would get duplicated in a list. set handles this automatically
-    abstract_lower = abstract.lower()
+    abstract_lower  = (abstract or "").lower()
+    category_tokens = set((categories or "").split())
 
     for cat_code, subfield in CATEGORY_MAP.items():
-        if cat_code in categories:
-            # categories is a space-separated string like "cs.LG cs.CV stat.ML".
-            # Python's `in` checks substring existence — fast and readable
+        if cat_code in category_tokens or any(
+            tok.startswith(cat_code + ".") for tok in category_tokens
+        ):
             subfields.add(subfield)
 
     for subfield, keywords in KEYWORD_MAP.items():
@@ -196,7 +213,7 @@ def score_keyword_complexity(abstract: str) -> float:
     matches        = sum(1 for kw in COMPLEXITY_KEYWORDS if kw in abstract_lower)
     return min(100.0, matches * 15.0)
     # each complexity keyword adds 15 points, capped at 100.
-    # cap prevents a single unusually math-heavy abstract from dominating the composite
+    # cap prevents a single unusually math-heavy abstract from dominating
 
 
 def score_length(abstract: str) -> float:
@@ -216,8 +233,8 @@ def score_prerequisites(abstract: str) -> float:
     abstract_lower = abstract.lower()
     matches        = sum(1 for kw in PREREQUISITE_KEYWORDS if kw in abstract_lower)
     return min(100.0, matches * 25.0)
-    # prerequisite phrases are strong signals — even one match meaningfully raises
-    # the bar for a reader, so each one gets a larger weight than complexity keywords
+    # prerequisite phrases are strong signals — even one match meaningfully
+    # raises the bar for a reader, so each one gets a larger weight than complexity keywords
 
 
 def score_resources(abstract: str) -> float:
@@ -229,6 +246,7 @@ def score_resources(abstract: str) -> float:
 
 
 def compute_difficulty(abstract: str) -> tuple[float, str]:
+    abstract = abstract or ""
     scores = {
         "keyword"      : score_keyword_complexity(abstract),
         "length"       : score_length(abstract),
@@ -240,8 +258,8 @@ def compute_difficulty(abstract: str) -> tuple[float, str]:
         scores[signal] * weight
         for signal, weight in DIFFICULTY_WEIGHTS.items()
     )
-    # weighted sum — each signal score (0-100) multiplied by its weight, then summed.
-    # weights add up to 1.0 so the composite stays in the 0-100 range
+    # weighted sum — each signal score (0-100) multiplied by its weight.
+    # weights sum to 1.0 so composite stays in 0-100 range
 
     if composite < 25:
         level = "Beginner"
@@ -270,7 +288,7 @@ def split_papers_by_period(papers: list) -> tuple[list, list]:
 def compute_frequency(papers: list, keyword: str) -> float:
     if not papers:
         return 0.0
-    count = sum(1 for p in papers if keyword in p["abstract"].lower())
+    count = sum(1 for p in papers if keyword in (p["abstract"] or "").lower())
     return count / len(papers)
     # normalize by corpus size so two periods of different sizes are comparable.
     # result: 30 matches in 150 papers → 0.2 (20% of papers mention this keyword)
@@ -302,7 +320,7 @@ def classify_trend_status(growth_rate: float, recent_freq: float) -> str:
 # -------------------------------------------------------------------
 
 def detect_domains(abstract: str) -> list[str]:
-    abstract_lower = abstract.lower()
+    abstract_lower = (abstract or "").lower()
     matched        = []
 
     for domain, keywords in DOMAIN_KEYWORDS.items():
@@ -315,7 +333,7 @@ def detect_domains(abstract: str) -> list[str]:
 
 
 def detect_methods(abstract: str) -> list[str]:
-    abstract_lower = abstract.lower()
+    abstract_lower = (abstract or "").lower()
     return [method for method in METHODS if method in abstract_lower]
     # method names are specific enough to match directly — "transformer" in an abstract
     # almost always means the architecture, not something else
@@ -349,7 +367,7 @@ def classify_gap_status(count: int, method: str, trends_data: dict) -> str:
         return "unexplored"
     if count <= GAP_THRESHOLD:
         trend = trends_data.get(method, {}).get("growth_rate", 0)
-        # chained .get() with defaults — if method isn't in trends we get {}.
+        # chained .get() with defaults — if method isn't in trends, we get {}.
         # then .get("growth_rate", 0) gives us 0. no KeyError, no crash
         if trend > 0.3:
             return "widening"
@@ -357,6 +375,67 @@ def classify_gap_status(count: int, method: str, trends_data: dict) -> str:
             return "closing"
         return "emerging"
     return "active"
+
+
+# -------------------------------------------------------------------
+# FEASIBILITY HELPERS
+# -------------------------------------------------------------------
+
+def check_obsolescence(method: str, method_total: int) -> tuple[bool, str]:
+    is_too_rare = method_total < MIN_METHOD_ACTIVITY
+
+    if is_too_rare and method in SUCCESSOR_MAP:
+        reason = f"Likely replaced by {SUCCESSOR_MAP[method]}"
+        return True, reason
+
+    if is_too_rare:
+        reason = f"Method appears in only {method_total} papers recently — may be fading"
+        return True, reason
+
+    return False, ""
+    # returning (is_obsolete, reason) keeps the caller clean —
+    # it gets both the decision and the explanation in one call
+
+
+def compute_feasibility(
+    count        : int,
+    method_total : int,
+    domain_total : int,
+    is_obsolete  : bool,
+) -> tuple[float, str]:
+
+    score = 100.0
+
+    if count == 0:
+        score -= 40.0
+        # zero papers means unverified — the combination might be nonsensical.
+        # we don't go to zero because "unexplored" can still be valid
+
+    if method_total < MIN_METHOD_ACTIVITY:
+        score -= 35.0
+        # method is barely used anywhere — high risk the gap exists because
+        # researchers already moved on, not because it's an open problem
+
+    if domain_total < MIN_DOMAIN_ACTIVITY:
+        score -= 25.0
+        # domain is too niche — even if you publish, audience is tiny
+        # and finding collaborators or datasets will be hard
+
+    if is_obsolete:
+        score -= 20.0
+        # stacks on top of method_total penalty — double confirmation of obsolescence
+
+    score = max(0.0, score)
+    # floor at zero — negative scores have no meaningful interpretation
+
+    if score >= 70:
+        label = "High"
+    elif score >= 40:
+        label = "Medium"
+    else:
+        label = "Low"
+
+    return round(score, 2), label
 
 
 # -------------------------------------------------------------------
@@ -441,18 +520,17 @@ def run_trend_analysis():
     inserted = 0
 
     for keyword in TREND_KEYWORDS:
-        hist_freq   = compute_frequency(historical, keyword)
-        recent_freq = compute_frequency(recent, keyword)
-        growth      = compute_growth_rate(hist_freq, recent_freq)
+        hist_freq    = compute_frequency(historical, keyword)
+        recent_freq  = compute_frequency(recent, keyword)
+        growth       = compute_growth_rate(hist_freq, recent_freq)
+        trend_status = classify_trend_status(growth, recent_freq)
 
         for period, freq in [("historical", hist_freq), ("recent", recent_freq)]:
-            # loop over a list of tuples — inserts both rows without repeating cursor.execute twice
+            status_for_row = trend_status if period == "recent" else None
             cursor.execute("""
-                INSERT OR REPLACE INTO trends (keyword, period, frequency, growth_rate)
-                VALUES (?, ?, ?, ?)
-            """, (keyword, period, freq, growth))
-            # INSERT OR REPLACE not INSERT OR IGNORE — re-running should update frequencies
-            # with fresh data, not silently skip them
+                INSERT OR REPLACE INTO trends (keyword, period, frequency, growth_rate, trend_status)
+                VALUES (?, ?, ?, ?, ?)
+            """, (keyword, period, freq, growth, status_for_row))
             inserted += 1
 
     conn.commit()
@@ -480,32 +558,111 @@ def run_gap_detection():
     # makes trends_data["transformer"]["growth_rate"] possible in classify_gap_status
 
     print(f"Building gap matrix from {len(papers)} papers...")
-    matrix   = build_gap_matrix(papers)
+    matrix = build_gap_matrix(papers)
+
+    method_totals = {
+        method: sum(matrix[(method, domain)] for domain in DOMAINS)
+        for method in METHODS
+    }
+    domain_totals = {
+        domain: sum(matrix[(method, domain)] for method in METHODS)
+        for domain in DOMAINS
+    }
+
     inserted = 0
 
     for (method, domain), count in matrix.items():
         status = classify_gap_status(count, method, trends_data)
 
-        is_gap     = count <= GAP_THRESHOLD
-        feas_score = min(100, count * 10) if count > 0 else 20
-        # heuristic: 0 papers → 20 (not zero — combination might still make sense),
-        # 1 paper → 10, 10+ papers → capped at 100. easy to understand and tune
-        feas_label = "High" if feas_score >= 70 else "Medium" if feas_score >= 40 else "Low"
+        is_obsolete, obs_reason = check_obsolescence(method, method_totals[method])
+        feas_score, feas_label  = compute_feasibility(
+            count,
+            method_totals[method],
+            domain_totals[domain],
+            is_obsolete,
+        )
+
+        flags  = obs_reason if is_obsolete else ""
+        status = "obsolete" if is_obsolete else status
 
         cursor.execute("""
             INSERT OR REPLACE INTO gaps
-                (method, domain, paper_count, feasibility_score, feasibility_label, status)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (method, domain, count, feas_score, feas_label, status))
-        # INSERT OR REPLACE — re-running updates scores rather than creating duplicates
-        # because UNIQUE(method, domain) fires and REPLACE overwrites cleanly
+                (method, domain, paper_count, feasibility_score, feasibility_label, status, flags)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (method, domain, count, feas_score, feas_label, status, flags))
 
-        if is_gap:
+        if count <= GAP_THRESHOLD:
             inserted += 1
 
     conn.commit()
     conn.close()
-    print(f"Gap detection complete. {inserted} gaps identified.")
+    print(f"Gap detection complete. {inserted} true gaps found (of {len(matrix)} total method-domain pairs).")
+
+
+def run_feasibility_filter():
+    # Standalone re-scoring utility — re-applies feasibility logic to existing gap rows
+    # without rebuilding the full matrix. Useful when tuning thresholds (GAP_THRESHOLD,
+    # MIN_METHOD_ACTIVITY, MIN_DOMAIN_ACTIVITY) without re-running the full pipeline.
+    # Not called by the main pipeline because run_gap_detection already covers it.
+    conn   = get_connection()
+    cursor = conn.cursor()
+
+    method_totals = {
+        row["method"]: row["total"]
+        for row in cursor.execute("""
+            SELECT method, SUM(paper_count) as total
+            FROM gaps
+            GROUP BY method
+        """).fetchall()
+    }
+
+    domain_totals = {
+        row["domain"]: row["total"]
+        for row in cursor.execute("""
+            SELECT domain, SUM(paper_count) as total
+            FROM gaps
+            GROUP BY domain
+        """).fetchall()
+    }
+
+    all_entries = cursor.execute(
+        "SELECT id, method, domain, paper_count, status FROM gaps"
+    ).fetchall()
+
+    print(f"Running feasibility filter on {len(all_entries)} method-domain pairs...")
+    updated = 0
+
+    for gap in all_entries:
+        method_total = method_totals.get(gap["method"], 0)
+        domain_total = domain_totals.get(gap["domain"], 0)
+
+        is_obsolete, obs_reason = check_obsolescence(gap["method"], method_total)
+
+        feas_score, feas_label = compute_feasibility(
+            gap["paper_count"],
+            method_total,
+            domain_total,
+            is_obsolete,
+        )
+
+        flags  = obs_reason if is_obsolete else ""
+        status = "obsolete" if is_obsolete else gap["status"]
+        # override status to obsolete only when check_obsolescence confirms it —
+        # preserves widening/closing/emerging for genuinely active gaps
+
+        cursor.execute("""
+            UPDATE gaps
+            SET feasibility_score = ?,
+                feasibility_label = ?,
+                flags             = ?,
+                status            = ?
+            WHERE id = ?
+        """, (feas_score, feas_label, flags, status, gap["id"]))
+        updated += 1
+
+    conn.commit()
+    conn.close()
+    print(f"Feasibility filter complete. Updated {updated} entries.")
 
 
 if __name__ == "__main__":

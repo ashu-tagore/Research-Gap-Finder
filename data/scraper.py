@@ -57,7 +57,7 @@ def parse_entry(entry) -> dict:
     abstract = entry.summary.replace("\n", " ").strip()
     authors   = ", ".join(a.name for a in entry.get("authors", []))
     categories = " ".join(t.term for t in entry.get("tags", []))
-    published  = entry.published[:10]
+    published  = getattr(entry, "published", "")[:10]
     pdf_link   = next(
         (l.href for l in entry.get("links", []) if l.get("type") == "application/pdf"),
         ""
@@ -120,18 +120,19 @@ def fetch_batch(start: int) -> list:
     return None
 
 
-def save_papers(papers: list) -> tuple[int, int]:
-    conn    = get_connection()
-    cursor  = conn.cursor()
-    saved   = 0
-    skipped = 0
+def save_papers(papers: list) -> tuple[int, int, int]:
+    conn      = get_connection()
+    cursor    = conn.cursor()
+    saved     = 0
+    invalid   = 0
+    duplicate = 0
 
     for paper in papers:
         valid, reason = is_valid(paper)
 
         if not valid:
             print(f"  Invalid paper {paper.get('arxiv_id', 'UNKNOWN')}: {reason}")
-            skipped += 1
+            invalid += 1
             continue
 
         try:
@@ -150,20 +151,21 @@ def save_papers(papers: list) -> tuple[int, int]:
             if cursor.rowcount == 1:
                 saved += 1
             else:
-                skipped += 1
+                duplicate += 1
 
         except Exception as e:
             print(f"  Skipping {paper.get('arxiv_id', 'UNKNOWN')}: {e}")
-            skipped += 1
+            invalid += 1
 
     conn.commit()
     conn.close()
-    return saved, skipped
+    return saved, invalid, duplicate
 
 def run_scraper():
     print(f"Starting scrape: {MAX_RESULTS} papers in batches of {BATCH_SIZE}")
-    total_saved   = 0
-    total_skipped = 0
+    total_saved     = 0
+    total_invalid   = 0
+    total_duplicate = 0
 
     for start in range(0, MAX_RESULTS, BATCH_SIZE):
         batch_num = (start // BATCH_SIZE) + 1
@@ -179,17 +181,19 @@ def run_scraper():
             print("  Empty batch — stopping early.")
             break
 
-        saved, skipped = save_papers(papers)
-        total_saved   += saved
-        total_skipped += skipped
-        print(f"  Saved: {saved} | Skipped/Duplicate: {skipped}")
+        saved, invalid, duplicate = save_papers(papers)
+        total_saved     += saved
+        total_invalid   += invalid
+        total_duplicate += duplicate
+        print(f"  Saved: {saved} | Invalid: {invalid} | Duplicate: {duplicate}")
 
         if start + BATCH_SIZE < MAX_RESULTS:
             time.sleep(SLEEP_TIME)
 
     print(f"\nScrape complete.")
-    print(f"Total saved   : {total_saved}")
-    print(f"Total skipped : {total_skipped}")
+    print(f"Total saved     : {total_saved}")
+    print(f"Total invalid   : {total_invalid}")
+    print(f"Total duplicate : {total_duplicate}")
 
 
 if __name__ == "__main__":

@@ -42,14 +42,22 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS trends (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            keyword     TEXT NOT NULL,
-            period      TEXT NOT NULL,
-            frequency   REAL,
-            growth_rate REAL,
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            keyword      TEXT NOT NULL,
+            period       TEXT NOT NULL,
+            frequency    REAL,
+            growth_rate  REAL,
+            trend_status TEXT,
             UNIQUE(keyword, period)
         );
     """)
+
+    # migration: add trend_status to existing databases that predate this column
+    try:
+        cursor.execute("ALTER TABLE trends ADD COLUMN trend_status TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
     conn.commit()
     conn.close()
