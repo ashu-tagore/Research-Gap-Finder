@@ -1,7 +1,9 @@
 import re
 from .db import get_connection
 
+# -------------------------------------------------------------------
 # CONFIGURATION
+# -------------------------------------------------------------------
 
 # direct lookup table. arXiv category → human-readable subfield.
 # researchers assigned these themselves on submission — most reliable signal we have
@@ -101,12 +103,57 @@ DOMAIN_KEYWORDS = {
     "Agriculture"   : ["crop", "agriculture", "farming", "soil", "yield", "irrigation", "pest"],
 }
 
+# difficulty signal weights — arbitrary but tunable.
+# keyword complexity weighted highest because it's the most direct signal
+# of theoretical depth in ML papers
+DIFFICULTY_WEIGHTS = {
+    "keyword"      : 0.35,
+    "length"       : 0.15,
+    "prerequisites": 0.30,
+    "resources"    : 0.20,
+}
+
+# words that strongly indicate theoretical or mathematical depth
+COMPLEXITY_KEYWORDS = [
+    "theorem", "proof", "convergence", "optimization landscape",
+    "gradient descent", "bayesian", "variational inference",
+    "markov chain", "stochastic", "topology", "manifold",
+    "eigenvalue", "matrix decomposition", "information theory",
+]
+
+# phrases that signal the paper builds on advanced prior work —
+# a reader needs deep domain knowledge just to understand the baseline
+PREREQUISITE_KEYWORDS = [
+    "assumes familiarity",
+    "building on",
+    "extending",
+    "following",
+    "we adopt",
+    "based on the framework",
+    "novel framework",
+    "first work to",
+]
+
+# phrases that signal expensive compute requirements —
+# high resource need = high barrier to reproduce or build on
+RESOURCE_KEYWORDS = [
+    "v100", "a100", "h100",
+    "gpu hours", "tpu",
+    "billion parameters",
+    "million samples",
+    "weeks of training",
+    "large-scale",
+    "distributed training",
+]
+
 # if fewer than this many papers exist for a method-domain pair, we call it a gap.
 # tunable — raise for stricter gaps, lower for more gaps
 GAP_THRESHOLD = 5
 
 
+# -------------------------------------------------------------------
 # CLASSIFICATION HELPERS
+# -------------------------------------------------------------------
 
 def classify_paper(categories: str, abstract: str) -> list[str]:
     subfields      = set()
@@ -140,7 +187,78 @@ def classify_paper(categories: str, abstract: str) -> list[str]:
     # sorted for consistent ordering — ensures "Computer Vision,NLP" not "NLP,Computer Vision" randomly each run
 
 
+# -------------------------------------------------------------------
+# DIFFICULTY HELPERS
+# -------------------------------------------------------------------
+
+def score_keyword_complexity(abstract: str) -> float:
+    abstract_lower = abstract.lower()
+    matches        = sum(1 for kw in COMPLEXITY_KEYWORDS if kw in abstract_lower)
+    return min(100.0, matches * 15.0)
+    # each complexity keyword adds 15 points, capped at 100.
+    # cap prevents a single unusually math-heavy abstract from dominating the composite
+
+
+def score_length(abstract: str) -> float:
+    word_count = len(abstract.split())
+    if word_count < 100:
+        return 20.0
+    if word_count < 150:
+        return 40.0
+    if word_count < 200:
+        return 60.0
+    return 80.0
+    # longer abstracts tend to describe more complex systems —
+    # simple papers say less, complex papers need more words to set up context
+
+
+def score_prerequisites(abstract: str) -> float:
+    abstract_lower = abstract.lower()
+    matches        = sum(1 for kw in PREREQUISITE_KEYWORDS if kw in abstract_lower)
+    return min(100.0, matches * 25.0)
+    # prerequisite phrases are strong signals — even one match meaningfully raises
+    # the bar for a reader, so each one gets a larger weight than complexity keywords
+
+
+def score_resources(abstract: str) -> float:
+    abstract_lower = abstract.lower()
+    matches        = sum(1 for kw in RESOURCE_KEYWORDS if kw in abstract_lower)
+    return min(100.0, matches * 30.0)
+    # resource keywords are rare but decisive — mentioning "A100" or "billion parameters"
+    # immediately signals this paper is out of reach for most researchers
+
+
+def compute_difficulty(abstract: str) -> tuple[float, str]:
+    scores = {
+        "keyword"      : score_keyword_complexity(abstract),
+        "length"       : score_length(abstract),
+        "prerequisites": score_prerequisites(abstract),
+        "resources"    : score_resources(abstract),
+    }
+
+    composite = sum(
+        scores[signal] * weight
+        for signal, weight in DIFFICULTY_WEIGHTS.items()
+    )
+    # weighted sum — each signal score (0-100) multiplied by its weight, then summed.
+    # weights add up to 1.0 so the composite stays in the 0-100 range
+
+    if composite < 25:
+        level = "Beginner"
+    elif composite < 50:
+        level = "Intermediate"
+    elif composite < 75:
+        level = "Advanced"
+    else:
+        level = "Expert"
+
+    return round(composite, 2), level
+    # round to 2 decimal places — more precision implies false accuracy for a heuristic system
+
+
+# -------------------------------------------------------------------
 # TREND HELPERS
+# -------------------------------------------------------------------
 
 def split_papers_by_period(papers: list) -> tuple[list, list]:
     sorted_papers = sorted(papers, key=lambda p: p["published_date"])
@@ -179,11 +297,13 @@ def classify_trend_status(growth_rate: float, recent_freq: float) -> str:
     return "stable"
 
 
+# -------------------------------------------------------------------
 # GAP DETECTION HELPERS
+# -------------------------------------------------------------------
 
 def detect_domains(abstract: str) -> list[str]:
     abstract_lower = abstract.lower()
-    matched = []
+    matched        = []
 
     for domain, keywords in DOMAIN_KEYWORDS.items():
         if any(kw in abstract_lower for kw in keywords):
@@ -229,7 +349,7 @@ def classify_gap_status(count: int, method: str, trends_data: dict) -> str:
         return "unexplored"
     if count <= GAP_THRESHOLD:
         trend = trends_data.get(method, {}).get("growth_rate", 0)
-        # chained .get() with defaults — if method isn't in trends, we get {}.
+        # chained .get() with defaults — if method isn't in trends we get {}.
         # then .get("growth_rate", 0) gives us 0. no KeyError, no crash
         if trend > 0.3:
             return "widening"
@@ -239,7 +359,9 @@ def classify_gap_status(count: int, method: str, trends_data: dict) -> str:
     return "active"
 
 
+# -------------------------------------------------------------------
 # RUNNERS
+# -------------------------------------------------------------------
 
 def run_classification():
     conn   = get_connection()
@@ -271,6 +393,33 @@ def run_classification():
     # committing 300 times would hit disk 300 times. one commit is far faster
     conn.close()
     print(f"Classification complete. Updated {updated} papers.")
+
+
+def run_difficulty_scoring():
+    conn   = get_connection()
+    cursor = conn.cursor()
+
+    papers = cursor.execute(
+        "SELECT id, abstract FROM papers WHERE difficulty_score IS NULL"
+    ).fetchall()
+    # WHERE difficulty_score IS NULL — only scores unscored papers.
+    # same idempotent pattern used throughout: safe to re-run, never double-processes
+
+    print(f"Scoring difficulty for {len(papers)} papers...")
+    updated = 0
+
+    for paper in papers:
+        score, level = compute_difficulty(paper["abstract"])
+
+        cursor.execute(
+            "UPDATE papers SET difficulty_score = ?, difficulty_level = ? WHERE id = ?",
+            (score, level, paper["id"])
+        )
+        updated += 1
+
+    conn.commit()
+    conn.close()
+    print(f"Difficulty scoring complete. Updated {updated} papers.")
 
 
 def run_trend_analysis():
@@ -331,7 +480,7 @@ def run_gap_detection():
     # makes trends_data["transformer"]["growth_rate"] possible in classify_gap_status
 
     print(f"Building gap matrix from {len(papers)} papers...")
-    matrix  = build_gap_matrix(papers)
+    matrix   = build_gap_matrix(papers)
     inserted = 0
 
     for (method, domain), count in matrix.items():
@@ -361,5 +510,6 @@ def run_gap_detection():
 
 if __name__ == "__main__":
     run_classification()
+    run_difficulty_scoring()
     run_trend_analysis()
     run_gap_detection()
